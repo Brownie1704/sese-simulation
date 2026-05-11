@@ -1,323 +1,260 @@
-import simpy
 import numpy as np
+import pandas as pd
 import math
-import copy
-import random
-from dataclasses import dataclass
-from typing import List, Optional
 
+np.random.seed(42)
 
-# REPRODUCIBILITY
-SEED = 42
-np.random.seed(SEED)
-random.seed(SEED)
+# ==============================================================================
+# 1. REALISTIC PARAMETERS
+# ==============================================================================
+NUM_HOSPITALS = 50
+NUM_REQUESTS = 5240
+SIM_DAYS = 7 
+SIM_MINUTES = SIM_DAYS * 24 * 60
+AMBULANCE_SPEED_KM_PER_MIN = 1.25  # ~75 km/h
+REJECTION_PENALTY_MEAN = 12.0      # 12 mins lost per failed phone/radio contact
+REJECTION_PENALTY_STD = 3.0
 
-# GLOBAL PARAMETERS
-N_HOSPITALS   = 50
-N_REQUESTS    = 500
-SIM_DURATION  = 1440
-N_CAPS        = 14
-ESI_PROBS     = [0.05, 0.20, 0.45, 0.20, 0.10]
+TIER_DISTRIBUTION = [4, 8, 38]
+CAPABILITY_DIMS = 14 
 
-TIER_SPEC = {
-    "L1_Trauma":  {"n": 4,  "p_cap": 0.95, "log_mu": 5.5},
-    "L2_Trauma":  {"n": 8,  "p_cap": 0.75, "log_mu": 5.0},
-    "Comm_ICU":   {"n": 22, "p_cap": 0.45, "log_mu": 4.8},
-    "Comm_noICU": {"n": 16, "p_cap": 0.20, "log_mu": 4.5},
-}
+# ==============================================================================
+# 2. GENERATE HOSPITALS
+# ==============================================================================
+hospitals = []
+tier_names = ["Level I", "Level II", "Community"]
 
-REF_TIME_PARAMS = {
-    "POB":  (45.0, 12.0),
-    "SD":   (31.0,  9.0),
-    "SESE": (17.0,  5.0),
-}
+for tier, count in enumerate(TIER_DISTRIBUTION):
+    for _ in range(count):
+        angle = np.random.uniform(0, 2 * math.pi)
+        radius = np.random.uniform(0, 30)
+        x, y = radius * math.cos(angle), radius * math.sin(angle)
+        
+        base_beds = int(np.random.lognormal(mean=math.log(35), sigma=0.4))
+        cap_prob = [0.80, 0.40, 0.10][tier]
+        capabilities = np.random.binomial(1, cap_prob, CAPABILITY_DIMS)
+        capabilities[0] = 1 # All hospitals have basic ED
+        
+        distance_from_center = math.sqrt(x**2 + y**2)
+        equity_score = min(1.0, distance_from_center / 30.0) 
+        
+        hospitals.append({
+            "id": len(hospitals), "tier": tier_names[tier],
+            "x": x, "y": y, "base_beds": base_beds,
+            "capabilities": capabilities, "equity_score": equity_score
+        })
 
-# DATA STRUCTURES
-@dataclass
-class Hospital:
-    id         : int
-    tier       : str
-    beds_total : int
-    beds_avail : int
-    caps       : List[int]
-    lat        : float
-    lon        : float
+# ==============================================================================
+# 3. GENERATE REQUESTS
+# ==============================================================================
+requests = []
+current_time = 0
+ESI_PROBS = [0.05, 0.20, 0.45, 0.20, 0.10]
 
-@dataclass
-class Request:
-    id           : int
-    arrival_time : float
-    esi          : int
-    caps_needed  : List[int]
-    lat          : float
-    lon          : float
+while len(requests) < NUM_REQUESTS and current_time < SIM_MINUTES:
+    hour_of_day = (current_time / 60) % 24
+    arrival_rate = 0.4 + 0.3 * (math.exp(-0.5 * ((hour_of_day - 9)/2)**2) + 
+                                math.exp(-0.5 * ((hour_of_day - 20)/2)**2))
+    current_time += np.random.exponential(1.0 / arrival_rate)
+    if current_time >= SIM_MINUTES: break
+    
+    esi = np.random.choice([1, 2, 3, 4, 5], p=ESI_PROBS)
+    req_caps = np.zeros(CAPABILITY_DIMS, dtype=int)
+    
+    if esi <= 2: req_caps[:4] = np.random.binomial(1, 0.8, 4) 
+    elif esi == 3: req_caps[:2] = np.random.binomial(1, 0.5, 2)
+    req_caps[0] = 1 
+        
+    angle = np.random.uniform(0, 2 * math.pi)
+    radius = np.random.uniform(0, 30)
+    
+    requests.append({
+        "id": len(requests), "time": current_time,
+        "x": radius * math.cos(angle), "y": radius * math.sin(angle),
+        "esi": esi, "required_capabilities": req_caps
+    })
 
-@dataclass
-class RouteResult:
-    req_id    : int
-    esi       : int
-    condition : str
-    matched   : bool
-    ref_time  : float
-    collision : bool
-    dcli      : int
+# ==============================================================================
+# 4. STATE DYNAMICS (Beds, Capabilities, and DIVERSION)
+# ==============================================================================
+def get_available_beds(hospital, time_min):
+    hour = (time_min / 60) % 24
+    # Base occupancy 80%, peaking at 95%
+    occupancy_rate = 0.80 + 0.15 * math.sin((hour - 8) * math.pi / 12) 
+    noise = np.random.normal(0, 0.03)
+    occupancy_rate = max(0.60, min(0.99, occupancy_rate + noise))
+    return max(0, int(hospital["base_beds"] * (1 - occupancy_rate)))
 
-# HOSPITAL GENERATION
-def build_hospitals():
-    hospitals = []
-    hid = 0
-    for tier, spec in TIER_SPEC.items():
-        for _ in range(spec["n"]):
-            total = max(20, int(
-                np.random.lognormal(spec["log_mu"], 0.5)))
-            occ   = np.random.uniform(0.65, 0.92)
-            avail = max(1, int(total * (1.0 - occ)))
-            caps  = np.random.binomial(
-                        1, spec["p_cap"], N_CAPS).tolist()
-            hospitals.append(Hospital(
-                id=hid,
-                tier=tier,
-                beds_total=total,
-                beds_avail=avail,
-                caps=caps,
-                lat=np.random.uniform(-0.35, 0.35),
-                lon=np.random.uniform(-0.35, 0.35),
-            ))
-            hid += 1
-    return hospitals
+def is_on_diversion(hospital, time_min):
+    """
+    Real-world friction: Hospitals >80% full often go on 'Ambulance Diversion' 
+    and reject incoming EMS, even if they technically have 1 or 2 beds left.
+    """
+    beds = get_available_beds(hospital, time_min)
+    occupancy = 1.0 - (beds / hospital["base_beds"])
+    if occupancy > 0.80:
+        return np.random.rand() < 0.70 # 70% chance of rejecting if crowded
+    return False
 
-# REQUEST GENERATION
-def _intensity(t):
-    morning = 0.45 * math.exp(-((t - 540)**2)  / (2 * 85**2))
-    evening = 0.65 * math.exp(-((t - 1200)**2) / (2 * 85**2))
-    return max(0.04, morning + evening)
+def get_realtime_capabilities(hospital):
+    realtime_caps = hospital["capabilities"].copy()
+    for i in range(1, CAPABILITY_DIMS):
+        if realtime_caps[i] == 1:
+            if np.random.rand() < 0.30: # 30% chance specialized equipment is busy
+                realtime_caps[i] = 0
+    return realtime_caps
 
-def build_requests():
-    reqs = []
-    t    = 0.0
-    while len(reqs) < N_REQUESTS:
-        t += np.random.exponential(1.0 / _intensity(t))
-        if t >= SIM_DURATION:
-            break
-        esi       = int(np.random.choice(
-                        [1, 2, 3, 4, 5], p=ESI_PROBS))
-        n_caps_req = max(1, 6 - esi)
-        caps_need  = random.sample(range(N_CAPS), n_caps_req)
-        reqs.append(Request(
-            id=len(reqs),
-            arrival_time=round(t, 2),
-            esi=esi,
-            caps_needed=caps_need,
-            lat=np.random.uniform(-0.40, 0.40),
-            lon=np.random.uniform(-0.40, 0.40),
-        ))
-    return reqs[:N_REQUESTS]
+def get_future_beds(hospital, time_min, transport_time):
+    actual_future_beds = get_available_beds(hospital, time_min + transport_time)
+    prediction_error = np.random.normal(-0.5, 0.8) 
+    return max(0, int(actual_future_beds + prediction_error))
 
-# UTILITY FUNCTIONS
-def haversine_approx(lat1, lon1, lat2, lon2):
-    R    = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    return R * math.sqrt(dlat**2 + dlon**2)
+# ==============================================================================
+# 5. ROUTING ALGORITHMS
+# ==============================================================================
+def calculate_transport_time(req, hosp):
+    dist = math.sqrt((req["x"] - hosp["x"])**2 + (req["y"] - hosp["y"])**2)
+    return dist / AMBULANCE_SPEED_KM_PER_MIN
 
-def caps_satisfied(hosp, req):
-    return all(hosp.caps[c] == 1 for c in req.caps_needed)
+def check_capability_match(req_caps, hosp_caps):
+    return np.all(hosp_caps >= req_caps)
 
-def mock_embed(seed_val, dim=64):
-    rng = np.random.default_rng(seed_val)
-    v   = rng.standard_normal(dim)
-    return v / (np.linalg.norm(v) + 1e-9)
+def route_pob(req):
+    sorted_hosps = sorted(hospitals, key=lambda h: calculate_transport_time(req, h))
+    first_h = sorted_hosps[0]
+    first_match = 1 if (not is_on_diversion(first_h, req["time"]) and
+                        get_available_beds(first_h, req["time"]) > 0 and 
+                        check_capability_match(req["required_capabilities"], get_realtime_capabilities(first_h))) else 0
+    
+    attempts = 0
+    for h in sorted_hosps:
+        attempts += 1
+        t_transport = calculate_transport_time(req, h)
+        
+        # POB gets rejected if hospital is on diversion, full, or lacks capability
+        if is_on_diversion(h, req["time"]):
+            continue # REJECTED
+            
+        beds = get_available_beds(h, req["time"])
+        realtime_caps = get_realtime_capabilities(h)
+        
+        if beds > 0 and check_capability_match(req["required_capabilities"], realtime_caps):
+            future_beds = get_available_beds(h, req["time"] + t_transport)
+            collision = 1 if future_beds == 0 else 0
+            art = t_transport + (attempts - 1) * np.random.normal(REJECTION_PENALTY_MEAN, REJECTION_PENALTY_STD)
+            return h["id"], art, attempts, first_match, 0, collision
+            
+    return sorted_hosps[0]["id"], 60.0, attempts, first_match, 0, 1
 
-def cosine_sim(a, b):
-    return float(
-        np.dot(a, b) /
-        (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9)
-    )
+def route_sd(req):
+    # Static Directory: Uses 24h old data. It DOES NOT know who is on diversion right now.
+    candidates = [h for h in hospitals if check_capability_match(req["required_capabilities"], h["capabilities"])]
+    if not candidates: candidates = hospitals 
+        
+    sorted_hosps = sorted(candidates, key=lambda h: calculate_transport_time(req, h))
+    first_h = sorted_hosps[0]
+    first_match = 1 if (not is_on_diversion(first_h, req["time"]) and
+                        get_available_beds(first_h, req["time"]) > 0 and 
+                        check_capability_match(req["required_capabilities"], get_realtime_capabilities(first_h))) else 0
+    
+    attempts = 0
+    for h in sorted_hosps:
+        attempts += 1
+        t_transport = calculate_transport_time(req, h)
+        
+        # SD calls the hospital. If they are on diversion, REJECT.
+        if is_on_diversion(h, req["time"]):
+            continue # REJECTED
+            
+        beds = get_available_beds(h, req["time"])
+        realtime_caps = get_realtime_capabilities(h)
+        
+        if beds > 0 and check_capability_match(req["required_capabilities"], realtime_caps):
+            future_beds = get_available_beds(h, req["time"] + t_transport)
+            collision = 1 if future_beds == 0 else 0
+            art = t_transport + (attempts - 1) * np.random.normal(REJECTION_PENALTY_MEAN, REJECTION_PENALTY_STD)
+            return h["id"], art, attempts, first_match, 0, collision
+            
+    return sorted_hosps[0]["id"], 60.0, attempts, first_match, 0, 1
 
-# ROUTING STRATEGIES
-def route_proximity(req, hospitals):
-    best_dist = float("inf")
-    best_h    = None
-    for h in hospitals:
-        if h.beds_avail < 1:
+def route_sese(req, use_predictive=True):
+    t_transport_all = [calculate_transport_time(req, h) for h in hospitals]
+    t_min, t_max = min(t_transport_all), max(t_transport_all)
+    beds_all = [get_available_beds(h, req["time"]) for h in hospitals]
+    b_min, b_max = min(beds_all), max(beds_all)
+    
+    candidates = []
+    for i, h in enumerate(hospitals):
+        t_trans = t_transport_all[i]
+        
+        # SESE knows exactly who is on diversion via real-time FHIR and skips them
+        if is_on_diversion(h, req["time"]):
             continue
-        d = haversine_approx(req.lat, req.lon, h.lat, h.lon)
-        if d < best_dist:
-            best_dist = d
-            best_h    = h
-    return best_h
-
-def route_static_directory(req, hospitals):
-    best_dist = float("inf")
-    best_h    = None
-    for h in hospitals:
-        if h.beds_avail < 1:
+            
+        realtime_caps = get_realtime_capabilities(h)
+        if not check_capability_match(req["required_capabilities"], realtime_caps): 
             continue
-        stale = (random.random() < 0.25)
-        if not stale and not caps_satisfied(h, req):
-            continue
-        d = haversine_approx(req.lat, req.lon, h.lat, h.lon)
-        if d < best_dist:
-            best_dist = d
-            best_h    = h
-    return best_h
+            
+        if use_predictive:
+            if get_future_beds(h, req["time"], t_trans) <= 2: continue
+        else:
+            if beds_all[i] <= 1: continue
+            
+        norm_beds = (beds_all[i] - b_min) / (b_max - b_min + 1e-5)
+        norm_time = (t_trans - t_min) / (t_max - t_min + 1e-5)
+        equity = h["equity_score"]
+        
+        if req["esi"] <= 2: alpha, beta, gamma, delta = 0.4, 0.2, 0.3, 0.1 
+        else: alpha, beta, gamma, delta = 0.5, 0.3, 0.1, 0.1 
+            
+        score = (alpha * 1.0) + (beta * norm_beds) - (gamma * norm_time) + (delta * equity)
+        candidates.append((h, score, t_trans))
+        
+    if not candidates:
+        fallback = sorted(hospitals, key=lambda h: calculate_transport_time(req, h))[0]
+        return fallback["id"], calculate_transport_time(req, fallback) + 2.0, 1, 0, 1, 0
+        
+    best_h, _, best_t = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+    future_beds = get_available_beds(best_h, req["time"] + best_t)
+    collision = 1 if future_beds == 0 else 0
+    
+    return best_h["id"], best_t + 1.5, 1, 1, 0, collision 
 
-def route_sese(req, hospitals):
-    if req.esi <= 2:
-        alpha, beta, gamma = 0.20, 0.10, 0.70
-    else:
-        alpha, beta, gamma = 0.65, 0.15, 0.20
+# ==============================================================================
+# 6. RUN SIMULATION
+# ==============================================================================
+results = []
+for req in requests:
+    _, art_pob, dcli_pob, fmcs_pob, _, ccr_pob = route_pob(req)
+    _, art_sd, dcli_sd, fmcs_sd, _, ccr_sd = route_sd(req)
+    _, art_sese_np, dcli_np, fmcs_np, _, ccr_np = route_sese(req, use_predictive=False)
+    _, art_sese, dcli_sese, fmcs_sese, div_sese, ccr_sese = route_sese(req, use_predictive=True)
+    
+    results.append({
+        "POB_ART": art_pob, "POB_DCLI": dcli_pob, "POB_FMCS": fmcs_pob, "POB_CCR": ccr_pob,
+        "SD_ART": art_sd, "SD_DCLI": dcli_sd, "SD_FMCS": fmcs_sd, "SD_CCR": ccr_sd,
+        "SESE_NP_CCR": ccr_np,
+        "SESE_ART": art_sese, "SESE_DCLI": dcli_sese, "SESE_FMCS": fmcs_sese, 
+        "SESE_DIV": div_sese, "SESE_CCR": ccr_sese
+    })
 
-    req_embed  = mock_embed(req.id * 31 + 7)
-    best_score = -float("inf")
-    best_h     = None
+df = pd.DataFrame(results)
 
-    for h in hospitals:
-        if h.beds_avail < 1:
-            continue
-        if not caps_satisfied(h, req):
-            continue
-        h_embed   = mock_embed(h.id * 17 + 3)
-        sim       = cosine_sim(req_embed, h_embed)
-        dist_km   = haversine_approx(
-                        req.lat, req.lon, h.lat, h.lon)
-        pred_beds = h.beds_avail / max(1, h.beds_total)
-        score     = (alpha * sim
-                     + beta  * pred_beds
-                     - gamma * (dist_km / 40.0))
-        if score > best_score:
-            best_score = score
-            best_h     = h
-    return best_h
+# ==============================================================================
+# 7. OUTPUT METRICS
+# ==============================================================================
+print("--- TABLE 1: Average Referral Time (ART) and Cognitive Load ---")
+print(f"POB:   Mean ART = {df['POB_ART'].mean():.1f} min | DCLI = {df['POB_DCLI'].mean():.1f}")
+print(f"SD:    Mean ART = {df['SD_ART'].mean():.1f} min | DCLI = {df['SD_DCLI'].mean():.1f}")
+print(f"SESE:  Mean ART = {df['SESE_ART'].mean():.1f} min | DCLI = {df['SESE_DCLI'].mean():.1f}")
 
-# REFERRAL TIME SAMPLER
-def sample_ref_time(condition, esi):
-    mu, sigma = REF_TIME_PARAMS[condition]
-    if condition == "SESE" and esi <= 2:
-        mu -= 2.5
-    return max(3.0, float(np.random.normal(mu, sigma)))
+print("\n--- TABLE 2: First-Match Clinical Suitability (FMCS) & Diversion ---")
+print(f"POB:   FMCS = {df['POB_FMCS'].mean()*100:.1f}%")
+print(f"SD:    FMCS = {df['SD_FMCS'].mean()*100:.1f}%")
+print(f"SESE:  FMCS = {df['SESE_FMCS'].mean()*100:.1f}% | Diversion Rate = {df['SESE_DIV'].mean()*100:.1f}%")
 
-# SIMPY PROCESS
-def sim_process(env, hospitals, requests, condition, results):
-    routers = {
-        "POB":  route_proximity,
-        "SD":   route_static_directory,
-        "SESE": route_sese,
-    }
-    dcli_base = {"POB": 6, "SD": 3, "SESE": 1}
-    router    = routers[condition]
-
-    for req in requests:
-        wait = max(0.0, req.arrival_time - env.now)
-        yield env.timeout(wait)
-
-        chosen   = router(req, hospitals)
-        matched  = (chosen is not None and
-                    caps_satisfied(chosen, req))
-        ref_time = sample_ref_time(condition, req.esi)
-
-        collision = False
-        if chosen is not None:
-            used_frac = (
-                (chosen.beds_total - chosen.beds_avail + 1)
-                / max(1, chosen.beds_total)
-            )
-            collision = used_frac > 0.95
-            chosen.beds_avail = max(0, chosen.beds_avail - 1)
-
-        dcli = dcli_base[condition]
-        if not matched:
-            dcli += 2
-
-        results.append(RouteResult(
-            req_id=req.id,
-            esi=req.esi,
-            condition=condition,
-            matched=matched,
-            ref_time=round(ref_time, 2),
-            collision=collision,
-            dcli=dcli,
-        ))
-
-# PRINT RESULTS
-def print_divider():
-    print("=" * 65)
-
-def print_all_results(all_results):
-    print_divider()
-    print("  SESE SIMULATION RESULTS — COPY TO LATEX TABLES")
-    print_divider()
-
-    pob_art = np.mean(
-        [r.ref_time for r in all_results["POB"]])
-
-    for cond in ["POB", "SD", "SESE"]:
-        res   = all_results[cond]
-        n     = len(res)
-        art   = np.mean([r.ref_time  for r in res])
-        art_s = np.std ([r.ref_time  for r in res])
-        fmcs  = np.mean([r.matched   for r in res]) * 100
-        ccr   = np.mean([r.collision for r in res]) * 100
-        dcli  = np.mean([r.dcli      for r in res])
-        inc   = sum(1 for r in res if not r.matched)
-        red   = ((pob_art - art) / pob_art * 100
-                 if cond != "POB" else 0.0)
-
-        print(f"\n  CONDITION : {cond}")
-        print(f"  -----------------------------------------")
-        print(f"  TABLE I  - Mean ART    : {art:.1f} min")
-        print(f"  TABLE I  - Std Dev ART : {art_s:.1f} min")
-        print(f"  TABLE I  - Reduction   : {red:.1f}%")
-        print(f"  TABLE II - FMCS        : {fmcs:.1f}%")
-        print(f"  TABLE II - Incorrect   : {inc} / {n}")
-        print(f"  TABLE III- CCR         : {ccr:.1f}%")
-        print(f"  TABLE IV - DCLI        : {dcli:.1f} steps")
-
-    print_divider()
-    print("\n  ESI SUBGROUP BREAKDOWN (TABLE V)")
-    print_divider()
-    print(f"  {'ESI':>4} | {'POB FMCS':>10} | "
-          f"{'SESE FMCS':>10} | {'POB ART':>9} | "
-          f"{'SESE ART':>9}")
-    print(f"  {'-'*60}")
-
-    for level in [1, 2, 3, 4, 5]:
-        pob_sub  = [r for r in all_results["POB"]
-                    if r.esi == level]
-        sese_sub = [r for r in all_results["SESE"]
-                    if r.esi == level]
-        if pob_sub and sese_sub:
-            pf = np.mean([r.matched  for r in pob_sub])  * 100
-            sf = np.mean([r.matched  for r in sese_sub]) * 100
-            pa = np.mean([r.ref_time for r in pob_sub])
-            sa = np.mean([r.ref_time for r in sese_sub])
-            print(f"  {level:>4} | {pf:>10.1f} | "
-                  f"{sf:>10.1f} | {pa:>9.1f} | {sa:>9.1f}")
-
-    print_divider()
-    print("\n  Simulation complete!")
-    print("  Copy the values above into your LaTeX tables.")
-    print_divider()
-
-# MAIN
-def run_all():
-    hospitals_master = build_hospitals()
-    requests         = build_requests()
-    all_results      = {}
-
-    for condition in ["POB", "SD", "SESE"]:
-        print(f"Running {condition} simulation...")
-        hosp_copy = copy.deepcopy(hospitals_master)
-        results   = []
-        env       = simpy.Environment()
-        env.process(
-            sim_process(env, hosp_copy, requests,
-                        condition, results)
-        )
-        env.run(until=SIM_DURATION)
-        all_results[condition] = results
-
-    print_all_results(all_results)
-    return all_results
-
-run_all()
+print("\n--- TABLE 3: Ablation Study - Capacity Collision Rate (CCR) ---")
+print(f"POB:       CCR = {df['POB_CCR'].mean()*100:.1f}%")
+print(f"SD:        CCR = {df['SD_CCR'].mean()*100:.1f}%")
+print(f"SESE-NP:   CCR = {df['SESE_NP_CCR'].mean()*100:.1f}%")
+print(f"SESE:      CCR = {df['SESE_CCR'].mean()*100:.1f}%")
